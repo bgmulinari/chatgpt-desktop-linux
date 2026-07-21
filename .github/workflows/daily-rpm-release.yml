@@ -1,0 +1,179 @@
+name: Daily RPM Release
+
+on:
+  schedule:
+    # 06:17 UTC (03:17 in America/Sao_Paulo).
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: daily-rpm-release
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPOSITORY: ilysenko/codex-desktop-linux
+  SOURCE_REF: main
+  UPSTREAM_DMG_URL: https://persistent.oaistatic.com/codex-app-prod/ChatGPT.dmg
+  UPSTREAM_DMG_PATH: /tmp/codex-upstream/Codex.dmg
+  DMG_CACHE_SCHEMA_VERSION: v1
+
+jobs:
+  build-and-release:
+    name: Build and publish RPM
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Check out the latest source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: ${{ env.SOURCE_REPOSITORY }}
+          ref: ${{ env.SOURCE_REF }}
+          path: source
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y p7zip-full make g++ python3 curl unzip rpm
+          rpmbuild --version
+
+      - name: Capture upstream DMG identity
+        id: dmg-identity
+        run: |
+          set -euo pipefail
+
+          headers_file="$(mktemp)"
+          trap 'rm -f "$headers_file"' EXIT
+          curl -fsSLI "$UPSTREAM_DMG_URL" > "$headers_file"
+
+          last_modified="$(awk 'tolower($0) ~ /^last-modified:/ {sub(/\r$/,""); sub(/^[^:]+: /,""); print; exit}' "$headers_file")"
+          etag="$(awk 'tolower($0) ~ /^etag:/ {sub(/\r$/,""); sub(/^[^:]+: /,""); gsub(/"/,""); print; exit}' "$headers_file")"
+          content_length="$(awk 'tolower($0) ~ /^content-length:/ {sub(/\r$/,""); sub(/^[^:]+: /,""); print; exit}' "$headers_file")"
+          cache_segment="$(printf '%s|%s|%s\n' "$last_modified" "$etag" "$content_length" | sha256sum | cut -d' ' -f1)"
+
+          echo "cache_segment=$cache_segment" >> "$GITHUB_OUTPUT"
+
+      - name: Restore cached upstream DMG
+        id: dmg-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /tmp/codex-upstream/Codex.dmg
+          key: upstream-dmg-${{ env.DMG_CACHE_SCHEMA_VERSION }}-${{ steps.dmg-identity.outputs.cache_segment }}
+
+      - name: Download upstream DMG
+        if: steps.dmg-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p "$(dirname "$UPSTREAM_DMG_PATH")"
+          curl -fL --retry 3 --retry-all-errors -o "$UPSTREAM_DMG_PATH" "$UPSTREAM_DMG_URL"
+
+      - name: Record build inputs
+        id: inputs
+        working-directory: source
+        run: |
+          set -euo pipefail
+          test -s "$UPSTREAM_DMG_PATH"
+
+          source_sha="$(git rev-parse HEAD)"
+          dmg_sha="$(sha256sum "$UPSTREAM_DMG_PATH" | cut -d' ' -f1)"
+          built_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+          package_version="$(date -u '+%Y.%m.%d.%H%M%S')+${source_sha:0:8}"
+          release_tag="latest"
+
+          {
+            echo "source_sha=$source_sha"
+            echo "dmg_sha=$dmg_sha"
+            echo "built_at=$built_at"
+            echo "package_version=$package_version"
+            echo "release_tag=$release_tag"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build application from upstream DMG
+        working-directory: source
+        run: make build-app DMG="$UPSTREAM_DMG_PATH"
+
+      - name: Build RPM without updater
+        working-directory: source
+        run: make rpm PACKAGE_VERSION="${{ steps.inputs.outputs.package_version }}" PACKAGE_WITH_UPDATER=0
+
+      - name: Validate RPM
+        id: rpm
+        working-directory: source
+        run: |
+          set -euo pipefail
+
+          mapfile -t rpm_files < <(find dist -maxdepth 1 -type f -name '*.rpm' -print)
+          test "${#rpm_files[@]}" -eq 1
+          rpm_file="${rpm_files[0]}"
+
+          rpm -qip "$rpm_file"
+          rpm -qlp "$rpm_file" | tee /tmp/rpm-contents.txt >/dev/null
+          grep -q '/usr/bin/codex-desktop' /tmp/rpm-contents.txt
+
+          if grep -Eq 'codex-update-manager|codex-update-manager\.service|/update-builder/' /tmp/rpm-contents.txt; then
+            echo 'The updater or update-builder was unexpectedly included in the RPM.' >&2
+            exit 1
+          fi
+
+          rpm_name="$(basename "$rpm_file")"
+          (
+            cd "$(dirname "$rpm_file")"
+            sha256sum "$rpm_name" > "$rpm_name.sha256"
+          )
+
+          {
+            echo "path=${{ github.workspace }}/source/$rpm_file"
+            echo "checksum_path=${{ github.workspace }}/source/$rpm_file.sha256"
+            echo "name=$rpm_name"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Write release notes
+        run: |
+          cat > "$RUNNER_TEMP/release-notes.md" <<EOF
+          Automated RPM build without the bundled update manager.
+
+          - Source: https://github.com/${SOURCE_REPOSITORY}/commit/${{ steps.inputs.outputs.source_sha }}
+          - Source commit: \`${{ steps.inputs.outputs.source_sha }}\`
+          - Upstream DMG SHA-256: \`${{ steps.inputs.outputs.dmg_sha }}\`
+          - Package version: \`${{ steps.inputs.outputs.package_version }}\`
+          - Built at: ${{ steps.inputs.outputs.built_at }}
+          EOF
+
+      - name: Publish latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          if gh release view "${{ steps.inputs.outputs.release_tag }}" \
+              --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release delete "${{ steps.inputs.outputs.release_tag }}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --cleanup-tag \
+              --yes
+          else
+            # Remove an orphaned tag left by an interrupted prior replacement.
+            gh api \
+              --method DELETE \
+              "repos/${GITHUB_REPOSITORY}/git/refs/tags/${{ steps.inputs.outputs.release_tag }}" \
+              >/dev/null 2>&1 || true
+          fi
+
+          gh release create "${{ steps.inputs.outputs.release_tag }}" \
+            "${{ steps.rpm.outputs.path }}" \
+            "${{ steps.rpm.outputs.checksum_path }}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Daily RPM ${{ steps.inputs.outputs.package_version }}" \
+            --notes-file "$RUNNER_TEMP/release-notes.md" \
+            --latest
