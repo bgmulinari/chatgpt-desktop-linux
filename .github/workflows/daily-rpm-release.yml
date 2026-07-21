@@ -1,0 +1,329 @@
+name: Daily RPM Release
+
+on:
+  schedule:
+    - cron: '17 9 * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: daily-rpm-release
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPOSITORY: ilysenko/codex-desktop-linux
+  SOURCE_REF: main
+  UPSTREAM_DMG_URL: https://persistent.oaistatic.com/codex-app-prod/ChatGPT.dmg
+  UPSTREAM_DMG_PATH: /tmp/codex-upstream/Codex.dmg
+  DMG_CACHE_SCHEMA_VERSION: v1
+  PACKAGE_NAME: chatgpt-desktop
+  RPM_ASSET_NAME: chatgpt-desktop-latest.x86_64.rpm
+
+jobs:
+  build-and-release:
+    name: Build and publish RPM repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out the latest source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: ${{ env.SOURCE_REPOSITORY }}
+          ref: ${{ env.SOURCE_REF }}
+          path: source
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y p7zip-full make g++ python3 curl unzip rpm createrepo-c gnupg
+          rpmbuild --version
+          createrepo_c --version
+
+      - name: Capture upstream DMG identity
+        id: dmg-identity
+        run: |
+          set -euo pipefail
+
+          headers_file="$(mktemp)"
+          trap 'rm -f "$headers_file"' EXIT
+          curl -fsSLI "$UPSTREAM_DMG_URL" > "$headers_file"
+
+          last_modified="$(awk 'tolower($0) ~ /^last-modified:/ {sub(/\r$/,""); sub(/^[^:]+: /,""); print; exit}' "$headers_file")"
+          etag="$(awk 'tolower($0) ~ /^etag:/ {sub(/\r$/,""); sub(/^[^:]+: /,""); gsub(/"/,""); print; exit}' "$headers_file")"
+          content_length="$(awk 'tolower($0) ~ /^content-length:/ {sub(/\r$/,""); sub(/^[^:]+: /,""); print; exit}' "$headers_file")"
+          cache_segment="$(printf '%s|%s|%s\n' "$last_modified" "$etag" "$content_length" | sha256sum | cut -d' ' -f1)"
+
+          echo "cache_segment=$cache_segment" >> "$GITHUB_OUTPUT"
+
+      - name: Restore cached upstream DMG
+        id: dmg-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /tmp/codex-upstream/Codex.dmg
+          key: upstream-dmg-${{ env.DMG_CACHE_SCHEMA_VERSION }}-${{ steps.dmg-identity.outputs.cache_segment }}
+
+      - name: Download upstream DMG
+        if: steps.dmg-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p "$(dirname "$UPSTREAM_DMG_PATH")"
+          curl -fL --retry 3 --retry-all-errors -o "$UPSTREAM_DMG_PATH" "$UPSTREAM_DMG_URL"
+
+      - name: Record build inputs
+        id: inputs
+        working-directory: source
+        run: |
+          set -euo pipefail
+          test -s "$UPSTREAM_DMG_PATH"
+
+          source_sha="$(git rev-parse HEAD)"
+          dmg_sha="$(sha256sum "$UPSTREAM_DMG_PATH" | cut -d' ' -f1)"
+          built_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+          package_version="$(date -u '+%Y.%m.%d.%H%M%S')+${source_sha:0:8}"
+          release_tag="latest"
+
+          {
+            echo "source_sha=$source_sha"
+            echo "dmg_sha=$dmg_sha"
+            echo "built_at=$built_at"
+            echo "package_version=$package_version"
+            echo "release_tag=$release_tag"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build application from upstream DMG
+        working-directory: source
+        run: make build-app DMG="$UPSTREAM_DMG_PATH"
+
+      - name: Build RPM without updater
+        working-directory: source
+        run: |
+          PACKAGE_NAME="$PACKAGE_NAME" \
+          PACKAGE_VERSION="${{ steps.inputs.outputs.package_version }}" \
+          PACKAGE_WITH_UPDATER=0 \
+            ./scripts/build-rpm.sh
+
+      - name: Validate RPM
+        id: rpm
+        working-directory: source
+        run: |
+          set -euo pipefail
+
+          mapfile -t rpm_files < <(find dist -maxdepth 1 -type f -name '*.rpm' -print)
+          test "${#rpm_files[@]}" -eq 1
+          rpm_file="${rpm_files[0]}"
+
+          rpm -qip "$rpm_file"
+          test "$(rpm -qp --queryformat '%{NAME}' "$rpm_file")" = "$PACKAGE_NAME"
+          rpm -qlp "$rpm_file" | tee /tmp/rpm-contents.txt >/dev/null
+          grep -q "/usr/bin/$PACKAGE_NAME" /tmp/rpm-contents.txt
+
+          if grep -Eq 'codex-update-manager|codex-update-manager\.service|/update-builder/' /tmp/rpm-contents.txt; then
+            echo 'The updater or update-builder was unexpectedly included in the RPM.' >&2
+            exit 1
+          fi
+
+          echo "path=${{ github.workspace }}/source/$rpm_file" >> "$GITHUB_OUTPUT"
+
+      - name: Import RPM signing key
+        id: signing-key
+        env:
+          RPM_GPG_PRIVATE_KEY: ${{ secrets.RPM_GPG_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "$RPM_GPG_PRIVATE_KEY"
+
+          printf '%s\n' "$RPM_GPG_PRIVATE_KEY" | gpg --batch --import
+          fingerprint="$(
+            gpg --batch --with-colons --list-secret-keys \
+              | awk -F: '$1 == "fpr" { print $10; exit }'
+          )"
+          test -n "$fingerprint"
+          echo "fingerprint=$fingerprint" >> "$GITHUB_OUTPUT"
+
+          public_key="$RUNNER_TEMP/rpm-signing-key.asc"
+          gpg --batch --armor --export "$fingerprint" > "$public_key"
+          rpm --import "$public_key"
+
+          cat > "$HOME/.rpmmacros" <<EOF
+          %_signature gpg
+          %_gpg_name $fingerprint
+          %__gpg /usr/bin/gpg
+          %__gpg_sign_cmd %{__gpg} gpg --batch --no-verbose --no-armor --no-secmem-warning -u "%{_gpg_name}" -sbo %{__signature_filename} %{__plaintext_filename}
+          EOF
+
+      - name: Sign RPM and prepare stable release assets
+        id: release-assets
+        run: |
+          set -euo pipefail
+          release_dir="${{ github.workspace }}/release"
+          rpm_asset="$release_dir/$RPM_ASSET_NAME"
+          checksum_asset="$rpm_asset.sha256"
+          mkdir -p "$release_dir"
+
+          rpmsign --addsign "${{ steps.rpm.outputs.path }}"
+          rpm --checksig "${{ steps.rpm.outputs.path }}" | tee /tmp/rpm-signature.txt
+          grep -q 'signatures OK' /tmp/rpm-signature.txt
+
+          cp "${{ steps.rpm.outputs.path }}" "$rpm_asset"
+          (
+            cd "$release_dir"
+            sha256sum "$RPM_ASSET_NAME" > "$RPM_ASSET_NAME.sha256"
+          )
+
+          {
+            echo "rpm_path=$rpm_asset"
+            echo "checksum_path=$checksum_asset"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Generate signed DNF repository
+        id: dnf-repository
+        env:
+          SIGNING_FINGERPRINT: ${{ steps.signing-key.outputs.fingerprint }}
+        run: |
+          set -euo pipefail
+          pages_root="${{ github.workspace }}/pages"
+          rpm_repo="$pages_root/rpm/x86_64"
+          release_base="https://github.com/${GITHUB_REPOSITORY}/releases/download/latest/"
+          pages_base="https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}"
+          mkdir -p "$rpm_repo"
+
+          cp "${{ steps.release-assets.outputs.rpm_path }}" "$rpm_repo/$RPM_ASSET_NAME"
+          createrepo_c \
+            --checksum sha256 \
+            --baseurl "$release_base" \
+            "$rpm_repo"
+          rm "$rpm_repo/$RPM_ASSET_NAME"
+
+          gpg --batch --yes \
+            --default-key "$SIGNING_FINGERPRINT!" \
+            --detach-sign \
+            --armor \
+            "$rpm_repo/repodata/repomd.xml"
+          gpg --batch --armor --export "$SIGNING_FINGERPRINT" > "$pages_root/KEY.gpg"
+
+          printf '%s\n' \
+            '[chatgpt-desktop]' \
+            'name=ChatGPT Desktop for Linux (unofficial)' \
+            "baseurl=${pages_base}/rpm/\$basearch" \
+            'enabled=1' \
+            'gpgcheck=1' \
+            'repo_gpgcheck=1' \
+            "gpgkey=${pages_base}/KEY.gpg" \
+            'metadata_expire=6h' \
+            > "$pages_root/chatgpt-desktop.repo"
+          touch "$pages_root/.nojekyll"
+
+          test -s "$rpm_repo/repodata/repomd.xml"
+          test -s "$rpm_repo/repodata/repomd.xml.asc"
+          test -s "$pages_root/KEY.gpg"
+          test -s "$pages_root/chatgpt-desktop.repo"
+          echo "pages_root=$pages_root" >> "$GITHUB_OUTPUT"
+
+      - name: Write release notes
+        run: |
+          cat > "$RUNNER_TEMP/release-notes.md" <<EOF
+          Automated RPM build without the bundled update manager.
+
+          - Package: \`$PACKAGE_NAME\`
+          - Source: https://github.com/${SOURCE_REPOSITORY}/commit/${{ steps.inputs.outputs.source_sha }}
+          - Source commit: \`${{ steps.inputs.outputs.source_sha }}\`
+          - Upstream DMG SHA-256: \`${{ steps.inputs.outputs.dmg_sha }}\`
+          - Package version: \`${{ steps.inputs.outputs.package_version }}\`
+          - Built at: ${{ steps.inputs.outputs.built_at }}
+          EOF
+
+      - name: Publish latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          if gh release view "${{ steps.inputs.outputs.release_tag }}" \
+              --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "${{ steps.inputs.outputs.release_tag }}" \
+              "${{ steps.release-assets.outputs.rpm_path }}" \
+              "${{ steps.release-assets.outputs.checksum_path }}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber
+
+            mapfile -t release_assets < <(
+              gh release view "${{ steps.inputs.outputs.release_tag }}" \
+                --repo "$GITHUB_REPOSITORY" \
+                --json assets \
+                --jq '.assets[].name'
+            )
+            for asset in "${release_assets[@]}"; do
+              case "$asset" in
+                "$RPM_ASSET_NAME"|"$RPM_ASSET_NAME.sha256") ;;
+                *)
+                  gh release delete-asset "${{ steps.inputs.outputs.release_tag }}" \
+                    "$asset" \
+                    --repo "$GITHUB_REPOSITORY" \
+                    --yes
+                  ;;
+              esac
+            done
+
+            gh release edit "${{ steps.inputs.outputs.release_tag }}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Daily RPM ${{ steps.inputs.outputs.package_version }}" \
+              --notes-file "$RUNNER_TEMP/release-notes.md" \
+              --latest
+          else
+            # Remove an orphaned tag left by an interrupted prior replacement.
+            gh api \
+              --method DELETE \
+              "repos/${GITHUB_REPOSITORY}/git/refs/tags/${{ steps.inputs.outputs.release_tag }}" \
+              >/dev/null 2>&1 || true
+
+            gh release create "${{ steps.inputs.outputs.release_tag }}" \
+              "${{ steps.release-assets.outputs.rpm_path }}" \
+              "${{ steps.release-assets.outputs.checksum_path }}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "Daily RPM ${{ steps.inputs.outputs.package_version }}" \
+              --notes-file "$RUNNER_TEMP/release-notes.md" \
+              --latest
+          fi
+
+          remote_size="$(
+            gh release view "${{ steps.inputs.outputs.release_tag }}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json assets \
+              --jq ".assets[] | select(.name == \"$RPM_ASSET_NAME\") | .size"
+          )"
+          local_size="$(stat -c '%s' "${{ steps.release-assets.outputs.rpm_path }}")"
+          test "$remote_size" = "$local_size"
+
+      - name: Upload GitHub Pages artifact
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: ${{ steps.dnf-repository.outputs.pages_root }}
+
+  deploy-pages:
+    name: Deploy DNF repository
+    needs: build-and-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Deploy GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5.0.0
